@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+
+# Cloudways CFE Domain Scanner
+# Read-only: does not modify server configuration
+#
+# Features:
+# - Scans actual application directories under /home
+# - Ignores symlinks
+# - Reads domains from each app's conf/server.nginx
+# - Ignores default cloudwaysapps.com URLs
+# - Checks CFE DNS records
+# - Reports CFE, non-CFE and unknown domains
+# - Lists all applications with at least one CFE domain
+
+CFE_IP1="162.159.136.54"
+CFE_IP2="162.159.137.54"
+CFE_CNAME="secure.cloudways.cloud"
+
+HOST_ID=$(hostname -s)
+APP_BASE="/home/${HOST_ID}.cloudwaysapps.com"
+
+TOTAL_APPS=0
+CFE_APPS=0
+NON_CFE_APPS=0
+MIXED_APPS=0
+NO_DOMAIN_APPS=0
+PARTIAL_APPS=0
+
+TOTAL_DOMAINS=0
+CFE_DOMAINS=0
+NON_CFE_DOMAINS=0
+UNKNOWN_DOMAINS=0
+
+# Applications with at least one CFE domain
+CFE_APP_LIST=()
+
+command -v dig >/dev/null 2>&1 || {
+    echo "ERROR: dig command not found"
+    exit 1
+}
+
+if [[ ! -d "$APP_BASE" ]]; then
+    echo "ERROR: Application directory not found: $APP_BASE"
+    exit 1
+fi
+
+# Check public DNS records for CFE
+check_cfe() {
+    local domain="$1"
+    local cname ips lookup
+
+    DNS_IPS=""
+    DNS_CNAME=""
+    DNS_TYPE=""
+
+    cname=$(dig +time=3 +tries=1 +short CNAME "$domain" 2>/dev/null |
+        tr '[:upper:]' '[:lower:]' |
+        sed 's/\.$//')
+
+    ips=$(dig +time=3 +tries=1 +short A "$domain" 2>/dev/null |
+        grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
+        sort -u)
+
+    DNS_IPS="$ips"
+    DNS_CNAME="$cname"
+
+    if printf '%s\n' "$cname" |
+        grep -Fxq "$CFE_CNAME"; then
+        DNS_TYPE="CFE CNAME"
+        return 0
+    fi
+
+    if printf '%s\n' "$ips" |
+        grep -Fxq "$CFE_IP1"; then
+        DNS_TYPE="CFE A Record"
+        return 0
+    fi
+
+    if printf '%s\n' "$ips" |
+        grep -Fxq "$CFE_IP2"; then
+        DNS_TYPE="CFE A Record"
+        return 0
+    fi
+
+    # Check whether DNS resolution succeeded
+    lookup=$(dig +time=3 +tries=1 "$domain" A \
+        +noall +comments 2>/dev/null)
+
+    if ! grep -q 'status: NOERROR' <<< "$lookup"; then
+        DNS_TYPE="DNS lookup failed / unresolved"
+        return 2
+    fi
+
+    DNS_TYPE="Not CFE"
+    return 1
+}
+
+echo "================================================="
+echo "           CLOUDWAYS CFE DOMAIN SCAN"
+echo "================================================="
+echo "Server       : $(hostname)"
+echo "App Directory: $APP_BASE"
+echo "Date         : $(date -u)"
+echo "================================================="
+echo
+
+shopt -s nullglob
+
+for APP_PATH in "$APP_BASE"/*; do
+
+    # Ignore symlinks and non-directories
+    [[ -L "$APP_PATH" ]] && continue
+    [[ -d "$APP_PATH" ]] || continue
+
+    APP=$(basename "$APP_PATH")
+
+    # Cloudways-style application identifiers
+    [[ "$APP" =~ ^[a-z0-9]{10}$ ]] || continue
+
+    CONF="$APP_PATH/conf/server.nginx"
+
+    ((TOTAL_APPS++))
+
+    echo "-------------------------------------------------"
+    echo "APP: $APP"
+    echo "-------------------------------------------------"
+
+    # Ignore missing or symlinked configuration
+    if [[ ! -f "$CONF" || -L "$CONF" ]]; then
+        echo "  [SKIP] server.nginx missing or symlink"
+        ((NO_DOMAIN_APPS++))
+        echo
+        continue
+    fi
+
+    # Extract custom domains from server_name
+    DOMAINS=$(
+        sed 's/#.*//' "$CONF" |
+        awk '
+            /^[[:space:]]*server_name[[:space:]]+/ {
+                for (i=2; i<=NF; i++) {
+                    gsub(/;/, "", $i)
+                    print tolower($i)
+                }
+            }
+        ' |
+        grep -E '^[a-z0-9.-]+\.[a-z]{2,}$' |
+        grep -vE '(^|\.)cloudwaysapps\.com$' |
+        sort -u
+    )
+
+    if [[ -z "$DOMAINS" ]]; then
+        echo "  [INFO] No custom domains configured"
+        ((NO_DOMAIN_APPS++))
+        echo
+        continue
+    fi
+
+    APP_CFE=0
+    APP_NON_CFE=0
+    APP_UNKNOWN=0
+
+    while IFS= read -r DOMAIN; do
+
+        [[ -z "$DOMAIN" ]] && continue
+
+        ((TOTAL_DOMAINS++))
+
+        check_cfe "$DOMAIN"
+        RESULT=$?
+
+        case "$RESULT" in
+            0)
+                echo "  [CFE INTEGRATED] $DOMAIN"
+                echo "    Detection: $DNS_TYPE"
+                ((CFE_DOMAINS++))
+                ((APP_CFE++))
+                ;;
+            1)
+                echo "  [NOT CFE] $DOMAIN"
+                echo "    Detection: $DNS_TYPE"
+                ((NON_CFE_DOMAINS++))
+                ((APP_NON_CFE++))
+                ;;
+            2)
+                echo "  [UNKNOWN] $DOMAIN"
+                echo "    Detection: $DNS_TYPE"
+                ((UNKNOWN_DOMAINS++))
+                ((APP_UNKNOWN++))
+                ;;
+        esac
+
+        if [[ -n "$DNS_CNAME" ]]; then
+            echo "    CNAME: $(echo "$DNS_CNAME" | tr '\n' ' ')"
+        fi
+
+        if [[ -n "$DNS_IPS" ]]; then
+            echo "    IPs: $(echo "$DNS_IPS" | tr '\n' ' ')"
+        fi
+
+        echo
+
+    done <<< "$DOMAINS"
+
+    # Collect every application with at least one CFE domain
+    # Includes fully CFE and mixed applications
+    if (( APP_CFE > 0 )); then
+        CFE_APP_LIST+=("$APP")
+    fi
+
+    # Determine overall application status
+    if (( APP_CFE > 0 && APP_NON_CFE > 0 )); then
+        APP_STATUS="MIXED"
+        ((MIXED_APPS++))
+
+    elif (( APP_CFE > 0 && APP_NON_CFE == 0 && APP_UNKNOWN == 0 )); then
+        APP_STATUS="CFE INTEGRATED"
+        ((CFE_APPS++))
+
+    elif (( APP_NON_CFE > 0 && APP_CFE == 0 && APP_UNKNOWN == 0 )); then
+        APP_STATUS="NOT CFE INTEGRATED"
+        ((NON_CFE_APPS++))
+
+    else
+        APP_STATUS="PARTIAL / UNKNOWN"
+        ((PARTIAL_APPS++))
+    fi
+
+    echo "  APP STATUS: $APP_STATUS"
+    echo "  CFE Domains: $APP_CFE"
+    echo "  Non-CFE Domains: $APP_NON_CFE"
+    echo "  Unknown Domains: $APP_UNKNOWN"
+    echo
+
+done
+
+shopt -u nullglob
+
+# Final summary
+echo
+echo "================================================="
+echo "                FINAL SUMMARY"
+echo "================================================="
+printf "Total Applications Scanned : %s\n" "$TOTAL_APPS"
+printf "Fully CFE Applications     : %s\n" "$CFE_APPS"
+printf "Non-CFE Applications       : %s\n" "$NON_CFE_APPS"
+printf "Mixed Applications         : %s\n" "$MIXED_APPS"
+printf "Partial / Unknown Apps     : %s\n" "$PARTIAL_APPS"
+printf "No Domain / Missing Config : %s\n" "$NO_DOMAIN_APPS"
+echo "-------------------------------------------------"
+printf "Total Custom Domains       : %s\n" "$TOTAL_DOMAINS"
+printf "CFE DNS-Matched Domains    : %s\n" "$CFE_DOMAINS"
+printf "Non-CFE Domains            : %s\n" "$NON_CFE_DOMAINS"
+printf "Unknown DNS Domains        : %s\n" "$UNKNOWN_DOMAINS"
+echo "================================================="
+
+# Final list of all apps with one or more CFE domains
+echo
+echo "================================================="
+echo "    APPLICATIONS WITH AT LEAST ONE CFE DOMAIN"
+echo "================================================="
+
+if (( ${#CFE_APP_LIST[@]} > 0 )); then
+    printf '  %s\n' "${CFE_APP_LIST[@]}"
+else
+    echo "  No CFE-integrated applications found."
+fi
+
+echo "-------------------------------------------------"
+echo "Total Apps With CFE: ${#CFE_APP_LIST[@]}"
+echo "================================================="
